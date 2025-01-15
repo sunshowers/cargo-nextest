@@ -1,5 +1,6 @@
 use crate::errors::MaxFailParseError;
-use std::{fmt, str::FromStr};
+use serde::Deserialize;
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 /// Type for the max-fail flag
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,9 +56,55 @@ impl fmt::Display for MaxFail {
     }
 }
 
+impl<'de> Deserialize<'de> for MaxFail {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+
+        impl serde::de::Visitor<'_> for V {
+            type Value = MaxFail;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(formatter, "an integer or the string \"all\"")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                MaxFail::from_str(v).map_err(serde::de::Error::custom)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v.cmp(&0) {
+                    Ordering::Equal | Ordering::Less => Err(serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Unsigned(v as u64),
+                        &"a positive integer",
+                    )),
+                    Ordering::Greater => Ok(MaxFail::Count(v as usize)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(V)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        test_helpers::{build_platforms, temp_workspace},
+        NextestConfig,
+    };
+    use camino_tempfile::tempdir;
+    use indoc::indoc;
+    use test_case::test_case;
 
     #[test]
     fn maxfail_builder_from_str() {
@@ -81,6 +128,128 @@ mod tests {
 
         for input in failures {
             MaxFail::from_str(input).expect_err(&format!("expected input '{input}' to fail"));
+        }
+    }
+
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = 1
+        "#},
+        Some(MaxFail::Count(1))
+        ; "basic positive number"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = 100
+        "#},
+        Some(MaxFail::Count(100))
+        ; "large positive number"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = "all"
+        "#},
+        Some(MaxFail::All)
+        ; "all lowercase"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = "ALL"
+        "#},
+        Some(MaxFail::All)
+        ; "all uppercase"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = "42"
+        "#},
+        Some(MaxFail::Count(42))
+        ; "number as string"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = 0
+        "#},
+        None
+        ; "zero number"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = -1
+        "#},
+        None
+        ; "negative number"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = ""
+        "#},
+        None
+        ; "empty string"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = "invalid"
+        "#},
+        None
+        ; "invalid string"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = "-1"
+        "#},
+        None
+        ; "negative string number"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = "0"
+        "#},
+        None
+        ; "zero string number"
+    )]
+    #[test_case(
+        indoc! {r#"
+            [profile.custom]
+            max-fail = true
+        "#},
+        None
+        ; "boolean value triggers expecting message"
+    )]
+    fn parse_max_fail(config_contents: &str, max_fail: Option<MaxFail>) {
+        let workspace_dir = tempdir().unwrap();
+        let graph = temp_workspace(workspace_dir.path(), config_contents);
+
+        let config = NextestConfig::from_sources(
+            graph.workspace().root(),
+            &graph,
+            None,
+            [],
+            &Default::default(),
+        );
+
+        match max_fail {
+            None => assert!(config.is_err()),
+            Some(t) => {
+                let config = config.unwrap();
+                let profile = config
+                    .profile("custom")
+                    .unwrap()
+                    .apply_build_platforms(&build_platforms());
+
+                assert_eq!(profile.max_fail(), t);
+            }
         }
     }
 }
